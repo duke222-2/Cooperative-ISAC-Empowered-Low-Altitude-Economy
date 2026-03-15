@@ -1,132 +1,194 @@
-% 清除环境
+% 主程序：空间平滑 CPD 目标参数估计 (Monte Carlo 性能评估)
 clc; clear; close all;
 
 %% 1. 系统参数设置 (System Settings)
-fc = 4.9e9;           
-c0 = 3e8;             
-lambda = c0/fc;       
-BW = 20e6;            
-M = 612;              
-N = 7;                
-delta_f = 30e3;       
-Ts = 35.677e-6;       
-P = 16; Q = 24;       % UPA 天线阵列 (水平P, 垂直Q)
-L = P * Q;            
-R = 64;               
-K = 2;                
+params = struct();
+params.fc = 4.9e9;           
+params.c0 = 3e8;             
+params.lambda = params.c0 / params.fc;       
+params.BW = 20e6;            
+params.M = 300;              % 按照第一版代码设为 300
+params.N = 7;                
+params.delta_f = 30e3;       
+params.Ts = 35.677e-6;       
+params.P = 16; params.Q = 24; 
+params.L = params.P * params.Q;            
+params.R = 64;               
 
-% 模拟目标参数 (Range, Velocity, Angles)
-d_true = [180, 30];           
-v_true = [10, -20];            
-theta_true = deg2rad([10, 25]); 
-phi_true = deg2rad([30, 60]);  
+% 仿真遍历参数
+P_tx_dBm = 45:5:65;
+MC_trials = 100;      % 跑图建议 100+
+K_list = [2, 4];
 
-%% 2. 生成接收张量 Y (Tensor Formulation)
-Y = zeros(R, N, M);
-SNR_dB = 20;
-Frx_cell = cell(1, K); % 存储每个目标的合并矩阵
+% 目标真实参数 (最大支持4个目标)
+targets_all.d = [180, 30, 100, 150];
+targets_all.v = [10, -20, 5, -10];
+targets_all.th = deg2rad([10, 25, 40, 55]);
+targets_all.ph = deg2rad([30, 60, 15, 45]);
 
-for k = 1:K
-    vartheta = sin(theta_true(k)) * cos(phi_true(k));
-    psi = cos(theta_true(k));
+% 初始化结果存储结构体
+RES = struct('aoa', zeros(2, length(P_tx_dBm)), ...
+             'range', zeros(2, length(P_tx_dBm)), ...
+             'vel', zeros(2, length(P_tx_dBm)), ...
+             'pos', zeros(2, length(P_tx_dBm)));
+
+%% 2. 核心 Monte Carlo 仿真循环
+for k_idx = 1:length(K_list)
+    K = K_list(k_idx);
     
-    a_p = exp(1j*pi*(0:P-1)'*vartheta);
-    a_q = exp(1j*pi*(0:Q-1)'*psi);
-    a_upa = kron(a_q, a_p); 
+    % 为当前 K 截取有效的目标参数
+    t.d = targets_all.d(1:K);
+    t.v = targets_all.v(1:K);
+    t.th = targets_all.th(1:K);
+    t.ph = targets_all.ph(1:K);
     
-    % 为了保证实验可重复，固定随机种子
-    rng(k);
-    Frx = (randn(L, R) + 1j*randn(L, R))/sqrt(2*R); 
-    Frx_cell{k} = Frx; 
-    Ftx = (randn(L, 1) + 1j*randn(L, 1))/sqrt(2);   
-    
-    b_k = Frx' * a_upa * (a_upa' * Ftx); 
-    o_k = exp(1j*2*pi*Ts*(2*v_true(k)/lambda)*(0:N-1)'); 
-    g_k = exp(-1j*2*pi*delta_f*(2*d_true(k)/c0)*(0:M-1)'); 
-    
-    alpha_k = randn + 1j*randn; 
-    Y = Y + alpha_k * reshape(kron(g_k, kron(o_k, b_k)), [R, N, M]);
+    for p_idx = 1:length(P_tx_dBm)
+        curr_P = P_tx_dBm(p_idx);
+        fprintf('Calculating K=%d, Power=%d dBm ', K, curr_P);
+        
+        err_sq = zeros(1, 4); % 累加器: [range, vel, aoa, pos]
+        
+        for mc = 1:MC_trials
+            % A. 信号生成 (SNR随功率变化)
+            snr = curr_P - 45;
+            [Y, Frx_c] = gen_sig_tensor(params, t, K, snr, mc);
+            
+            % B. 运行核心算法: 优化的张量分解 (无 kron 冗余)
+            [A1, A2, z_hat] = Spatial_Smoothing_CPD_Optimized(Y, K);
+            
+            % C. 误差评估与配对 (向量化，无 @ 匿名函数)
+            errs = eval_errors_vectorized(z_hat, A2, A1, Frx_c, params, t, K);
+            
+            err_sq = err_sq + errs;
+            if mod(mc, 10) == 0, fprintf('.'); end
+        end
+        
+        % 计算并记录 RMSE
+        RES.range(k_idx, p_idx) = sqrt(err_sq(1) / (MC_trials * K));
+        RES.vel(k_idx, p_idx)   = sqrt(err_sq(2) / (MC_trials * K));
+        RES.aoa(k_idx, p_idx)   = sqrt(err_sq(3) / (MC_trials * K));
+        RES.pos(k_idx, p_idx)   = sqrt(err_sq(4) / (MC_trials * K));
+        fprintf(' Done\n');
+    end
 end
 
-noise = (randn(size(Y)) + 1j*randn(size(Y))) * 10^(-SNR_dB/20);
-Y = Y + noise;
+%% 3. 绘图部分 (四宫格展示 RMSE)
+figure('Color', 'w', 'Position', [100 100 900 700]);
+titles = {'(a) AoA', '(b) Range', '(c) Radial velocity', '(d) Position'};
+y_labels = {'RMSE (deg)', 'RMSE (m)', 'RMSE (m/s)', 'RMSE (m)'};
+fields = {'aoa', 'range', 'vel', 'pos'};
 
-%% 3. 执行张量分解 (CPD)
-% 假设已经定义了 Spatial_Smoothing_CPD 函数
-[A1_est, A2_est, A3_est, z_hat] = Spatial_Smoothing_CPD(Y, K);
+for i = 1:4
+    subplot(2, 2, i);
+    % K=2 实线，K=4 虚线
+    semilogy(P_tx_dBm, RES.(fields{i})(1,:), 'b-o', 'LineWidth', 2, 'MarkerSize', 8); hold on;
+    semilogy(P_tx_dBm, RES.(fields{i})(2,:), 'b--s', 'LineWidth', 1.8, 'MarkerSize', 7);
+    grid on; 
+    xlabel('Transmit power (dBm)', 'FontSize', 11); 
+    ylabel(y_labels{i}, 'FontSize', 11); 
+    title(titles{i}, 'FontSize', 12);
+    if i == 1
+        legend('Proposed, K=2', 'Proposed, K=4', 'Location', 'best'); 
+    end
+    set(gca, 'FontSize', 10);
+end
+fprintf('\n仿真完成！性能比较图已生成。\n');
 
-%% 4. 参数提取与目标配对 (Association)
-est_results = struct();
 
-% 预提取所有估计值
-for k = 1:K
-    % 距离
-    tau_est = angle(z_hat(k)) / (-2 * pi * delta_f);
-    est_results(k).dist = abs(tau_est * c0 / 2);
-    % 速度
-    fd_est = angle(A2_est(2,k)/A2_est(1,k)) / (2 * pi * Ts);
-    est_results(k).vel = fd_est * lambda / 2;
-    % 记录因子矩阵列索引
-    est_results(k).idx = k;
+%% =========================================================================
+%                               子函数模块区
+% =========================================================================
+
+%% 模块 A: 信号生成
+function [Y, Frx_c] = gen_sig_tensor(p, t, K, snr, mc)
+    Yc = zeros(p.R, p.N, p.M); 
+    Frx_c = cell(1, K);
+    
+    for k = 1:K
+        vt = sin(t.th(k)) * cos(t.ph(k)); 
+        ps = cos(t.th(k));
+        a_upa = kron(exp(1j*pi*(0:p.Q-1)'*ps), exp(1j*pi*(0:p.P-1)'*vt));
+        
+        % 保证每次 Monte Carlo 的噪声独立且可复现
+        rng(mc + k*100); 
+        Frx = (randn(p.L, p.R) + 1j*randn(p.L, p.R)) / sqrt(2*p.R); 
+        Frx_c{k} = Frx;
+        
+        bk = Frx' * a_upa * (a_upa' * (randn(p.L, 1) + 1j*randn(p.L, 1))/sqrt(2));
+        ok = exp(1j * 2*pi * p.Ts * (2*t.v(k)/p.lambda) * (0:p.N-1)');
+        gk = exp(-1j * 2*pi * p.delta_f * (2*t.d(k)/p.c0) * (0:p.M-1)');
+        
+        Yc = Yc + (randn + 1j*randn) * reshape(kron(gk, kron(ok, bk)), [p.R, p.N, p.M]);
+    end
+    
+    sig_p = norm(Yc(:))^2 / numel(Yc);
+    Y = Yc + sqrt(sig_p * 10^(-snr/10)) * (randn(size(Yc)) + 1j*randn(size(Yc))) / sqrt(2);
 end
 
-% 简单的配对逻辑：基于距离最接近原则
-% 在实际复杂场景下建议使用匈牙利算法 (matchpairs)
-matched_idx = zeros(1, K);
-remaining_est = 1:K;
-for k = 1:K
-    diffs = arrayfun(@(i) abs(est_results(i).dist - d_true(k)), remaining_est);
-    [~, min_pos] = min(diffs);
-    matched_idx(k) = remaining_est(min_pos);
-    remaining_est(min_pos) = [];
+%% 模块 B: 核心 CPD 分解 (已优化 kron)
+function [A1, A2, z_hat] = Spatial_Smoothing_CPD_Optimized(Y, K)
+    [R, N, M] = size(Y);
+    Y1_T = reshape(Y, R, N*M).';
+    
+    L1 = floor(M/2); 
+    L2 = M + 1 - L1;
+    
+    Ys = zeros(L1*N, R*L2);
+    for l = 1:L2
+        Ys(:, (l-1)*R + 1 : l*R) = Y1_T((l-1)*N + 1 : (l+L1-1)*N, :);
+    end
+    
+    [U, S, V] = svds(Ys, K);
+    Xi = pinv(U(1:(L1-1)*N, :)) * U(N+1:L1*N, :);
+    [M_mat, Z_diag] = eig(Xi);
+    z_hat = diag(Z_diag);
+    
+    A3 = (z_hat.^(0:M-1)).';
+    P_mat = inv(M_mat).';
+    
+    A2 = zeros(N, K); 
+    A1 = zeros(R, K);
+    
+    for k = 1:K
+        % 优化点：使用 reshape 替代 kron 提升速度
+        U_M_k = U * M_mat(:, k);
+        A2(:, k) = (reshape(U_M_k, N, L1) * conj(A3(1:L1, k))) / norm(A3(1:L1, k))^2;
+        
+        V_S_P_k = conj(V) * S * P_mat(:, k);
+        A1(:, k) = (reshape(V_S_P_k, R, L2) * conj(A3(1:L2, k))) / norm(A3(1:L2, k))^2;
+    end
 end
 
-%% 5. 输出结果与可视化 (Output and Visualization)
-fprintf('\n================ 参数估计对照结果 ================\n');
-est_plot_dist = zeros(1, K);
-est_plot_vel = zeros(1, K);
-est_plot_theta = zeros(1, K);
-est_plot_phi = zeros(1, K);
-
-for k = 1:K
-    idx = matched_idx(k); 
+%% 模块 C: 误差评估与配对 (向量化实现)
+function errs = eval_errors_vectorized(z, A2, A1, Frx, p, t, K)
+    errs = zeros(1, 4); % [ed, ev, ea, ep]
     
-    % 提取匹配后的角度
-    [theta_k_est, phi_k_est] = GRQ_AoA_Method(A1_est(:, idx), Frx_cell{k}, P, Q);
+    % 1. 预计算所有分解出来的距离，将其移出循环，节省计算量
+    all_dists_est = abs(angle(z) / (-2*pi*p.delta_f) * p.c0 / 2);
+    rem_idx = 1:K; 
     
-    % 存储用于绘图的数据
-    est_plot_dist(k) = est_results(idx).dist;
-    est_plot_vel(k) = est_results(idx).vel;
-    est_plot_theta(k) = rad2deg(theta_k_est);
-    est_plot_phi(k) = rad2deg(phi_k_est);
-    
-    % 终端打印 (保持原样)
-    fprintf('目标 %d: 距离误差 %.4f, 速度误差 %.4f\n', k, ...
-        abs(est_plot_dist(k) - d_true(k)), abs(est_plot_vel(k) - v_true(k)));
+    for k = 1:K
+        % 2. 向量化匹配最接近的距离
+        diffs = abs(all_dists_est(rem_idx) - t.d(k));
+        [~, min_pos] = min(diffs);
+        match_idx = rem_idx(min_pos);
+        
+        % 3. 提取匹配目标的参数估计值
+        dk_e = all_dists_est(match_idx);
+        vk_e = (angle(A2(2, match_idx) / A2(1, match_idx)) / (2*pi*p.Ts)) * p.lambda / 2;
+        
+        % 调用真实 AoA 搜索
+        [th_e, ph_e] = GRQ_AoA_Method(A1(:, match_idx), Frx{k}, p.P, p.Q);
+        
+        % 4. 计算平方误差
+        ed = (dk_e - t.d(k))^2;
+        ev = (vk_e - t.v(k))^2;
+        ea = (rad2deg(th_e) - rad2deg(t.th(k)))^2;
+        ep = ed + (t.d(k) * (th_e - t.th(k)))^2; % Position MSE 公式
+        
+        errs = errs + [ed, ev, ea, ep];
+        
+        % 5. 从候选池中剔除已匹配索引
+        rem_idx(min_pos) = [];
+    end
 end
-
-%% --- 绘图部分 (论文复现图) ---
-
-% 图 1: 距离-速度联合估计散点图 (Joint Range-Velocity Estimation)
-figure('Color', 'w', 'Name', 'Range-Velocity Estimation');
-plot(d_true, v_true, 'bo', 'MarkerSize', 12, 'LineWidth', 2); hold on;
-plot(est_plot_dist, est_plot_vel, 'r+', 'MarkerSize', 12, 'LineWidth', 2);
-grid on;
-xlabel('Distance (m)', 'FontSize', 12, 'FontWeight', 'bold');
-ylabel('Velocity (m/s)', 'FontSize', 12, 'FontWeight', 'bold');
-legend('True Values', 'Tensor Estimates', 'Location', 'best');
-title('Joint Range and Velocity Estimation Performance', 'FontSize', 14);
-set(gca, 'FontSize', 11);
-
-% 图 2: 角度估计散点图 (AoA Estimation: Theta vs Phi)
-figure('Color', 'w', 'Name', 'AoA Estimation');
-plot(rad2deg(theta_true), rad2deg(phi_true), 'bs', 'MarkerSize', 12, 'LineWidth', 2); hold on;
-plot(est_plot_theta, est_plot_phi, 'rx', 'MarkerSize', 12, 'LineWidth', 2);
-grid on;
-xlabel('Elevation Angle \theta (deg)', 'FontSize', 12, 'FontWeight', 'bold');
-ylabel('Azimuth Angle \phi (deg)', 'FontSize', 12, 'FontWeight', 'bold');
-legend('True AoA', 'Estimated AoA', 'Location', 'best');
-title('2D AoA (Elevation and Azimuth) Estimation', 'FontSize', 14);
-set(gca, 'FontSize', 11);
-
-fprintf('\n绘图完成！你可以向老师展示这两张图，证明张量分解能准确分离并估计多个目标参数。\n');
